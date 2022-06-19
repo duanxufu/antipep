@@ -1,6 +1,8 @@
 import os
+import random
 import warnings
 import time
+import statistics
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,10 +11,12 @@ from sklearn.metrics import accuracy_score, roc_auc_score, matthews_corrcoef, \
     f1_score, recall_score, precision_score, label_ranking_average_precision_score
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
+from transformers import MPNET_PRETRAINED_MODEL_ARCHIVE_LIST
 
 from utils.data import *
 from utils.model import myFlashTransformer
 from utils.util import save_model, load_model, save_param
+
 onnx_exec = True
 warnings.filterwarnings("ignore")
 
@@ -37,17 +41,17 @@ l4 = 2
 dropout = 0.4
 LR = 0.001
 step_size = 5
-batch_size = 512
+batch_size = 32
 gamma = 0.7
-slice_loc = [10, 100]
+slice_loc = [1, 1000]
 ratio = [0.8, 0.2]
-root = os.path.dirname(os.path.realpath(__file__))+'/model'  # 获取项目根目录
-name = os.path.basename(__file__).split(".")[0] \
-    # + 'Transppi_influenza'
+multi_sample = 4
+root = '/home/duanxf/model/antipep'  # 获取项目根目录
+name = os.path.basename(__file__).split(".")[0]
 title = datetime.datetime.now().strftime("%b%d_%Y_%H.%M")
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-TrainDataPath = 'dataset/AMPDB/amp.csv'
+TrainDataPath = '/home/duanxf/code/antipep/dataset/AMPDB/amp.csv'
 # TestDataPath = 'dataset/Benchmark/sAMPs.csv'
 trainFold, validFold = k_fold_split(all_peptide_file=TrainDataPath,
                                     kf_num=kf, slice_loc=slice_loc, )
@@ -65,6 +69,7 @@ def score2label(predictions):
         else:
             predictions_list.append(np.array([0, 1]))
     return predictions_list
+    
 
 
 def catFeature(batch):
@@ -105,13 +110,18 @@ def train(train_model, iterator, optimizer, criterion,):
     for batch in tqdm(iterator, ncols=0):
         optimizer.zero_grad()
         seq, label_batch = catFeature(batch)
-        prediction_batch = train_model(seq)
-        loss = criterion(prediction_batch, label_batch)
+        m_pred = train_model(seq)
+        losses = 0
+        for i in m_pred:
+            loss = criterion(i, label_batch)
+            losses += loss
+        loss = losses/multi_sample
         loss.backward()
         optimizer.step()
+        prediction_batch = m_pred[random.randint(0, multi_sample-1)].cpu().data.numpy()
         label_batch = list(label_batch.cpu().data.numpy())
         prediction_label = score2label(
-            list(prediction_batch.cpu().data.numpy()))
+            list(prediction_batch))
         acc, recall, f1, precision, mcc = metrics_epoch(
             label_batch, prediction_label)
         epoch_loss += np.float64(loss)
@@ -120,12 +130,16 @@ def train(train_model, iterator, optimizer, criterion,):
         epoch_f1 += np.float64(f1)
         epoch_precision += np.float64(precision)
         epoch_mcc += np.float64(mcc)
-        prediction = prediction + list(prediction_batch.cpu().data.numpy())
+        prediction = prediction + list(prediction_batch)
         label = label + label_batch
         len_iter = len(iterator)
-    return epoch_loss / len_iter, epoch_acc / len_iter, \
-        epoch_precision / len_iter, epoch_recall / len_iter, \
-        epoch_f1 / len_iter, epoch_mcc / len_iter, roc_auc_score(label, prediction), \
+    return epoch_loss / len_iter,\
+        epoch_acc / len_iter, \
+        epoch_precision / len_iter,\
+        epoch_recall / len_iter, \
+        epoch_f1 / len_iter,\
+        epoch_mcc / len_iter, \
+        roc_auc_score(label, prediction), \
         label_ranking_average_precision_score(label, prediction)
 
 
@@ -141,11 +155,15 @@ def valid(valid_model, iterator, criterion):
     label = []
     for batch in iterator:
         seq, label_batch = catFeature(batch)
-        prediction_batch = valid_model(seq)
-        loss = criterion(prediction_batch, label_batch)
+        m_pred = valid_model(seq)
+        losses = 0
+        for i in m_pred:
+            loss = criterion(i, label_batch)
+            losses += loss
+        loss = losses/multi_sample
+        prediction_batch = m_pred[random.randint(0, multi_sample-1)].cpu().data.numpy()
         label_batch = list(label_batch.cpu().data.numpy())
-        prediction_label = score2label(
-            list(prediction_batch.cpu().data.numpy()))
+        prediction_label = score2label(list(prediction_batch))
         acc, recall, f1, precision, mcc = metrics_epoch(
             label_batch, prediction_label)
         epoch_loss += np.float64(loss)
@@ -154,7 +172,7 @@ def valid(valid_model, iterator, criterion):
         epoch_f1 += np.float64(f1)
         epoch_precision += np.float64(precision)
         epoch_mcc += np.float64(mcc)
-        prediction = prediction + list(prediction_batch.cpu().data.numpy())
+        prediction = prediction + list(prediction_batch)
         label = label + label_batch
         len_iter = len(iterator)
     return epoch_loss / len_iter, epoch_acc / len_iter, \
@@ -165,7 +183,8 @@ def valid(valid_model, iterator, criterion):
 
 ave_list = [0, 0, 0, 0, 0, 0, 0, 0]
 for i in tqdm(range(kf), ncols=0):
-    model = myFlashTransformer(num_tokens=num_tokens,
+    model = myFlashTransformer(multi_sample=multi_sample,
+                               num_tokens=num_tokens,
                                dropout=dropout,
                                pool_dim=pool_dim,
                                kernel_size=kernel_size,
@@ -180,8 +199,9 @@ for i in tqdm(range(kf), ncols=0):
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), LR)
     scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
+    # criterion = nn.BCELoss().to(device)
     criterion = nn.BCELoss().to(device)
-    
+
     best_valid_mcc = -1.0
     train_loader = trainFold_loader[i]
     valid_loader = validFold_loader[i]
@@ -203,7 +223,7 @@ for i in tqdm(range(kf), ncols=0):
 
         if valid_mcc > best_valid_mcc:
             best_valid_mcc = valid_mcc
-            save_model(root=root, model=model,p=[valid_loss, valid_acc, valid_precision, valid_recall, valid_f1, valid_mcc, valid_roc, valid_auc],
+            save_model(root=root, model=model, p=[valid_loss, valid_acc, valid_precision, valid_recall, valid_f1, valid_mcc, valid_roc, valid_auc],
                        name=name, k=i, title=title)
         res = 'kf {}/{} epoch {}/{} valid: loss: {:.4f} acc: {:.4f} recall: {:.4f} f1: {:.4f} precision:{:.4f} mcc:{:.4f} roc: {:.4f} auc: {:.4f}'.format(
             i+1, kf, epoch+1, N_EPOCHS, valid_loss, valid_acc, valid_recall, valid_f1, valid_precision, valid_mcc, valid_roc, valid_auc)

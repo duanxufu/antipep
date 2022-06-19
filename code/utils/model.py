@@ -15,9 +15,10 @@ def list2TensorWith_T_CAt(embedding_list, t):
 
 
 class myFlashTransformer(nn.Module):
-    def __init__(self, num_tokens, dropout, pool_dim, kernel_size, stride, encoderConv, conv_dim, convPoolLen,
+    def __init__(self, multi_sample, num_tokens, dropout, pool_dim, kernel_size, stride, encoderConv, conv_dim, convPoolLen,
                  FLASHT_dim, FLASHT_depth, group_size, l1, l2, l3, l4):
         super().__init__()
+        self.multi_sample = multi_sample
         self.encoder = FLASHTransformer(
             num_tokens=num_tokens,
             dim=FLASHT_dim,
@@ -38,7 +39,7 @@ class myFlashTransformer(nn.Module):
                               padding='same')
         self.convPool = nn.AdaptiveMaxPool1d(convPoolLen)
         self.BN = nn.BatchNorm1d(conv_dim)
-        self.dropout = nn.AlphaDropout(dropout)
+        self.dropout = nn.Dropout(dropout)
         self.l1 = nn.Linear(conv_dim, l1)
         self.l2 = nn.Linear(convPoolLen, l2)
         self.l3 = nn.Linear(l2, l3)
@@ -59,10 +60,15 @@ class myFlashTransformer(nn.Module):
         BN_out = self.BN(relu(convPool_out)
                          )  # batch*convOutDim*len
         l1_out = self.l1(BN_out.transpose(1, 2)) # batch*len*dim
-        l2_out = self.l2(l1_out.squeeze(2))
-        l3_out = self.l3(l2_out)
-        l4_out = self.l4(l3_out)
-        output = self.sigmoidLayer(l4_out)
+        l1_out = l1_out.squeeze(2)
+        output = []
+        for i in range(self.multi_sample):
+            l2_out = self.l2(self.dropout(l1_out))
+            l3_out = self.l3(l2_out)
+            l4_out = self.l4(l3_out)
+            l4_out = self.sigmoidLayer(l4_out)
+            output.append(l4_out)
+       
         return output
 
 
